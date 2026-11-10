@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>junos-config-save</title>
+<style>
+body{font:14px system-ui,sans-serif;background:#0d1117;color:#c9d1d9;margin:0;padding:24px;max-width:900px}
+h1{font-size:1.3em} h2{font-size:1em;margin:0 0 10px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:16px}
+label{display:block;margin:10px 0 3px;font-size:.85em;color:#8b949e}
+input,select{width:100%;box-sizing:border-box;padding:7px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:5px}
+.row{display:flex;gap:12px}.row>div{flex:1}
+button{margin-top:12px;padding:7px 14px;background:#238636;color:#fff;border:0;border-radius:5px;cursor:pointer}
+button.sec{background:#30363d}
+pre{background:#010409;padding:10px;border-radius:5px;overflow:auto;white-space:pre-wrap}
+.hint{font-size:.75em;color:#8b949e;margin-top:4px}
+</style>
+</head>
+<body>
+<h1>junos-config-save</h1>
+
+<div class="card">
+<h2>Settings</h2>
+<label for="rjson">Location of router.json</label>
+<input id="rjson" value="/home/jnpr/projects/$TOPONAME/router.json" oninput="build()">
+<div class="hint">Default: the existing $TOPONAME server inventory. A same-origin JSON URL also works. For another filesystem path, select the matching file below.</div>
+<div class="row">
+<div><label for="duser">Default username</label><input id="duser" value="jnpr" autocomplete="off"></div>
+<div><label for="dpass">Default password (optional)</label><input id="dpass" type="password" autocomplete="new-password"></div>
+</div>
+<label for="rfile">Or pick a local inventory (takes priority over the location above)</label>
+<input id="rfile" type="file" accept=".json,application/json">
+<button onclick="loadSettings()">Load settings</button>
+<div id="rstat" class="hint"></div>
+<div id="rlist" style="margin-top:8px"></div>
+<div class="hint">Server inventories are read only from this portal; local files stay in this tab. The path and username can be remembered, but passwords are never saved in browser storage. Inventory credentials are not displayed. Username/password fields are for the defaults download; per-router credentials take priority. Protect credential files and use a trusted connection.</div>
+<button onclick="saveSettings()">Remember settings</button>
+<button class="sec" onclick="dl()">Download routers.json defaults</button>
+</div>
+
+<div class="card">
+<h2>Command builder</h2>
+<div class="row">
+<div><label for="act">Action</label>
+<select id="act" onchange="build()"><option>save</option><option>list</option><option>load (dry run)</option><option>load (commit)</option><option>confirm</option></select></div>
+<div><label for="ident">Identifier (save)</label><input id="ident" placeholder="baseline" oninput="build()"></div>
+</div>
+<div class="row">
+<div><label>Automatic save formats</label><div class="hint">Every save includes SET (.set), STANZA (.config), and JSON (.json).</div></div>
+<div><label for="rt">Routers (comma list, or all)</label><input id="rt" value="" oninput="build()"></div>
+</div>
+<div class="row">
+<div><label for="lf">File (load)</label><input id="lf" placeholder="change.set" oninput="build()"></div>
+<div><label for="cm">Confirm minutes (commit)</label><input id="cm" value="5" oninput="build()"></div>
+</div>
+<pre id="cmd"></pre>
+<button class="sec" onclick="navigator.clipboard.writeText(cmd.textContent)">Copy</button>
+<label for="configUpload">Configuration file to load (.set, .config, .conf)</label>
+<input id="configUpload" type="file" accept=".set,.config,.conf" onchange="invalidatePreview()">
+<button id="submitBtn" onclick="submitAction()">Submit Save / Preview Load</button>
+<button id="commitBtn" hidden onclick="commitLoad()">Commit previewed load (with rollback timer)</button>
+<button id="confirmBtn" hidden onclick="confirmLoad()">Confirm pending commit permanently</button>
+<div class="hint">Save runs on the server in all three formats. Load always previews and checks first. Review the output before committing; verify router health before confirming permanently. Override loads are not offered here.</div>
+<pre id="operationOutput" role="status">No operation submitted.</pre>
+<button id="browseBtn" class="sec" onclick="browseSaved()">Browse saved configurations</button>
+<div class="hint">Saved under /home/jnpr/projects/$TOPONAME/config/&lt;identifier&gt;/. Browse to download a file or select SET/STANZA for Load.</div>
+<div id="savedFiles"></div>
+<div id="savedSelection" class="hint"></div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const q=s=>/^[\w@%+=:,./\\-]+$/.test(s)?s:'"'+s.replace(/(["`$\\])/g,'\\$1')+'"';
+const TOPOLOGY_PATH='/home/jnpr/projects/$TOPONAME/router.json';
+let previewToken=null,confirmToken=null,confirmRouters=[],busy=false,storedFile=null;
+configUpload.addEventListener('change',()=>{storedFile=null;savedSelection.textContent=''});
+async function browseSaved(){
+  try{
+    const result=await requestAction({action:'browse'});
+    savedFiles.replaceChildren();
+    if(!result.files.length){savedFiles.textContent='No saved configurations found.';return}
+    for(const entry of result.files){
+      const row=document.createElement('div');
+      const label=document.createElement('span');
+      label.textContent='config/'+entry.identifier+'/'+entry.filename+' ('+entry.size_bytes+' bytes) ';
+      row.append(label);
+      for(const action of ['Download','Use for Load']){
+        if(action==='Use for Load'&&!/\.(set|config|conf)$/i.test(entry.filename))continue;
+        const button=document.createElement('button');button.className='sec';button.textContent=action;
+        button.onclick=async()=>{
+          try{
+            const result=await requestAction({action:'read',identifier:entry.identifier,filename:entry.filename});
+            if(action==='Download'){
+              const url=URL.createObjectURL(new Blob([result.content],{type:'text/plain;charset=utf-8'}));
+              const a=document.createElement('a');a.href=url;a.download=result.filename;a.click();
+              setTimeout(()=>URL.revokeObjectURL(url),1000);
+            }else{
+              storedFile={filename:result.filename,content:result.content};
+              configUpload.value='';lf.value=result.filename;act.value='load (dry run)';build();
+              savedSelection.textContent='Selected server file: config/'+entry.identifier+'/'+entry.filename;
+            }
+          }catch(e){showOperationError(e)}
+        };
+        row.append(button);
+      }
+      savedFiles.append(row);
+    }
+  }catch(e){showOperationError(e)}
+}
+function invalidatePreview(){previewToken=null;commitBtn.hidden=true}
+async function requestAction(body){
+  if(!/^https?:$/.test(location.protocol))throw Error('Open the deployed $TOPONAME page to execute operations.');
+  if(busy)throw Error('An operation is already running.');
+  busy=true;
+  for(const id of ['submitBtn','commitBtn','confirmBtn','browseBtn'])$(id).disabled=true;
+  operationOutput.textContent='Running; do not resubmit. This may take several minutes...';
+  try{
+    const response=await fetch('/$TOPONAME/dashboard/api/config-v22',{
+      method:'POST',credentials:'same-origin',
+      headers:{'Content-Type':'application/json','X-Junos-Config-Save':'1'},
+      body:JSON.stringify(body)
+    });
+    const text=await response.text();
+    let result;try{result=JSON.parse(text)}catch(e){throw Error('Server returned HTTP '+response.status+'. Check portal login/backend availability.')}
+    operationOutput.textContent=result.output||result.error||'No output returned.';
+    if(!response.ok||!result.ok)throw Error(result.error||'Operation failed; review output. Router state may be partial.');
+    return result;
+  }finally{
+    busy=false;
+    for(const id of ['submitBtn','commitBtn','confirmBtn','browseBtn'])$(id).disabled=false;
+  }
+}
+function executionBody(action){
+  const names=rt.value.trim()==='all'?[...rlist.querySelectorAll('input')].map(c=>c.value):rt.value.split(/[,\s]+/).filter(Boolean);
+  if(!names.length)throw Error('Load settings and select routers first.');
+  return {action,routers:names,inventory:rjson.value.trim()};
+}
+function showOperationError(e){operationOutput.textContent+='\\nERROR: '+e.message}
+async function submitAction(){
+  try{
+    invalidatePreview();
+    if(act.value==='save'){
+      const body=executionBody('save');body.identifier=ident.value;
+      await requestAction(body);
+    }else if(act.value.startsWith('load')){
+      const f=configUpload.files[0];if(!f&&!storedFile)throw Error('Select a file from Browse or upload a configuration.');
+      const body=executionBody('preview');body.filename=storedFile?storedFile.filename:f.name;body.content=storedFile?storedFile.content:await f.text();
+      const result=await requestAction(body);
+      previewToken=result.preview_token;commitBtn.hidden=!previewToken;
+    }else if(act.value==='list'){await browseSaved()}
+    else throw Error('Submit supports Save or Load. Use the separate confirmation button for pending commits.');
+  }catch(e){showOperationError(e)}
+}
+async function commitLoad(){
+  try{
+    if(!previewToken)throw Error('Preview the configuration first.');
+    const body=executionBody('commit');body.token=previewToken;body.minutes=Number(cm.value);
+    if(!Number.isInteger(body.minutes)||body.minutes<1||body.minutes>120)throw Error('Rollback timer must be 1-120 minutes.');
+    if(!confirm('Commit the previewed configuration to '+body.routers.join(', ')+' with automatic rollback in '+body.minutes+' minutes?'))return;
+    invalidatePreview();
+    const result=await requestAction(body);
+    confirmToken=result.confirm_token;confirmRouters=result.routers||[];
+    confirmBtn.hidden=!confirmToken;
+  }catch(e){showOperationError(e)}
+}
+async function confirmLoad(){
+  try{
+    if(!confirmToken)throw Error('No pending commit to confirm.');
+    if(!confirm('Have you verified router health? Permanently confirm the changes on '+confirmRouters.join(', ')+'?'))return;
+    const token=confirmToken;confirmToken=null;confirmBtn.hidden=true;
+    await requestAction({action:'confirm',token,routers:confirmRouters,inventory:TOPOLOGY_PATH});
+  }catch(e){showOperationError(e)}
+}
+function load(){
+  try{
+    rjson.value=localStorage.cs_rjson||TOPOLOGY_PATH;
+    duser.value=localStorage.cs_user||'jnpr';
+    sessionStorage.removeItem('cs_pass');
+  }catch(e){rstat.textContent='Browser storage unavailable: '+e.message}
+  build();
+}
+function saveSettings(){
+  try{localStorage.cs_rjson=rjson.value;localStorage.cs_user=duser.value}
+  catch(e){rstat.textContent='Cannot remember settings: '+e.message}
+  build();
+}
+function dl(){
+  const d={user:duser.value};if(dpass.value)d.password=dpass.value;
+  const b=new Blob([JSON.stringify({defaults:d,routers:{}},null,2)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='routers.defaults.json';a.click();
+}
+function build(){
+  invalidatePreview();
+  const a=act.value,base=['python','config_save.py'];
+  const g=rjson.value?['--routers-json',q(rjson.value)]:[];
+  const names=rt.value.trim()==='all'?['all']:rt.value.split(/[,\s]+/).filter(Boolean);
+  if(a!=='list'&&(!names.length||names.some(n=>!NAME.test(n)))){
+    cmd.textContent='Select at least one valid router.';return;
+  }
+  const r=names.join(' ');
+  let c;
+  if(a==='save')c=[...base,'save',...g,'-i',q(ident.value||'<identifier>'),'-f','set,stanza,json',r];
+  else if(a==='list')c=[...base,'list',...g];
+  else if(a==='confirm')c=[...base,'confirm',...g,r];
+  else{c=[...base,'load',...g,'--file',q(lf.value||'<file>')];
+    if(a.includes('commit'))c.push('--commit','--confirm-minutes',cm.value||'5');
+    c.push(r);}
+  cmd.textContent=c.join(' ');
+}
+const NAME=/^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+function inventoryRows(j){
+  const object=v=>v!==null&&typeof v==='object'&&!Array.isArray(v);
+  if(!object(j))throw Error('Inventory must be a JSON object.');
+  const defs=j.defaults||{};
+  if(!object(defs))throw Error('defaults must be an object.');
+  let entries,excluded=0;
+  if('devices' in j){
+    if(!Array.isArray(j.devices))throw Error('devices must be a list.');
+    entries=[];
+    for(const d of j.devices){
+      if(!object(d))throw Error('Each device must be an object.');
+      if(d.type!=='junos'){excluded++;continue}
+      const o={host:d.mgmt_ip,tags:d.tags||[]};
+      if(d.login){
+        if(typeof d.login!=='string'||d.login.indexOf('/')<1||d.login.indexOf('/')===d.login.length-1)
+          throw Error('A Junos login must use username/password format.');
+        o.user=d.login.slice(0,d.login.indexOf('/'));
+      }
+      if('user' in d)o.user=d.user;
+      entries.push([d.name,o]);
+    }
+  }else{
+    const src='routers' in j?j.routers:j;
+    if(!object(src))throw Error('routers must be an object.');
+    entries=Object.entries(src).map(([n,v])=>[n,typeof v==='string'?{host:v}:v]);
+  }
+  const seen=new Set();
+  for(const [n,o] of entries){
+    if(typeof n!=='string'||!NAME.test(n)||seen.has(n))throw Error('Invalid or duplicate router name.');
+    if(!object(o)||typeof o.host!=='string'||!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(o.host))
+      throw Error('A router has a missing/invalid host.');
+    if(!Array.isArray(o.tags||[])||(o.tags||[]).some(t=>typeof t!=='string'))
+      throw Error('Router tags must be a list of strings.');
+    seen.add(n);
+  }
+  if(!entries.length)throw Error('No Junos routers found.');
+  return {entries,defs,excluded};
+}
+async function loadSettings(){
+  rlist.replaceChildren();rt.value='';build();
+  rstat.textContent='Loading inventory...';
+  try{
+    const f=rfile.files[0];let text,source;
+    if(f){text=await f.text();source=f.name}
+    else{
+      if(!/^https?:$/.test(location.protocol))throw Error('Select a local inventory file, or open the $TOPONAME server page.');
+      const path=rjson.value.trim();
+      if(!path)throw Error('Enter an inventory location.');
+      if(path!==TOPOLOGY_PATH&&(/^[A-Za-z]:[\\/]/.test(path)||path.startsWith('/home/')))
+        throw Error('For another filesystem path, select the file below.');
+      const url=new URL(path===TOPOLOGY_PATH?'./router.json':path,location.href);
+      if(url.origin!==location.origin)throw Error('Only same-origin inventory URLs are allowed.');
+      const response=await fetch(url,{credentials:'same-origin',cache:'no-store',signal:AbortSignal.timeout(15000)});
+      if(!response.ok)throw Error('Inventory request failed (HTTP '+response.status+').');
+      text=await response.text();source=path;
+    }
+    let j;try{j=JSON.parse(text)}catch(e){throw Error('Inventory is not valid JSON. Check the file or portal login.')}
+    const {entries,defs,excluded}=inventoryRows(j);
+    if(defs.user)duser.value=defs.user;
+    entries.forEach(([n,o])=>{
+      const host=o.host,tags=(o.tags||[]).join(',');
+      const l=document.createElement('label');l.style.cssText='display:inline-block;margin:3px 12px 3px 0;color:#c9d1d9';
+      const c=document.createElement('input');c.type='checkbox';c.checked=true;c.value=n;c.style.cssText='width:auto;margin-right:5px';c.onchange=pick;
+      l.append(c,n+' ('+host+(tags?' ['+tags+']':'')+')');rlist.append(l);
+    });
+    rstat.textContent=entries.length+' routers loaded from '+source+(excluded?'; '+excluded+' non-Junos devices excluded':'');
+    pick();
+  }catch(e){rstat.textContent='Cannot load settings: '+e.message}
+}
+function pick(){
+  const all=[...rlist.querySelectorAll('input')],on=all.filter(c=>c.checked).map(c=>c.value);
+  rt.value=on.join(',');build();
+}
+load();
+</script>
+</body>
+</html>

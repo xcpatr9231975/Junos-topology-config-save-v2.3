@@ -1,0 +1,7 @@
+# Publish only the standalone tool, UI, documentation, and tests.
+*
+!/.gitignore
+!/config_save.py
+!/config-save.html
+!/README.md
+!/test_config_save.py
